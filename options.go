@@ -11,12 +11,16 @@ import (
 	"time"
 
 	"github.com/liustack/sqlite"
+	"github.com/liustack/sqlite/replica"
 )
 
 type config struct {
-	params        url.Values
-	sqliteOptions []sqlite.Option
-	poolSize      int
+	name, path       string
+	params           url.Values
+	sqliteOptions    []sqlite.Option
+	poolSize         int
+	backup           *replica.Config
+	restoreOnMissing bool
 }
 
 // Option configures the database opened by Open.

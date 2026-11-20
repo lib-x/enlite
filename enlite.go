@@ -1,5 +1,17 @@
 // Package enlite connects Ent's SQLite dialect to the cgo-free
 // github.com/liustack/sqlite driver.
+//
+// # S3-compatible backups
+//
+// [OpenWithBackup] opens a local SQLite file and backs it up to S3-compatible
+// storage. Use an S3 URI with a local parameter or supply [WithBackup] for a
+// local DSN. The replica manages WAL and checkpoints and uploads commits
+// asynchronously. Closing the Ent client closes the pool and then the replica.
+// [BackupDriver.SyncBackup] waits for committed changes to reach the store.
+// For a manual restore to a new local file, use [replica.Restore].
+// See examples/s3backup for a complete program.
+//
+// [replica.Restore]: https://pkg.go.dev/github.com/liustack/sqlite@v0.1.7/replica#Restore
 package enlite
 
 import (
@@ -27,49 +39,75 @@ import (
 // because each connection otherwise gets a separate database. For a pooled
 // in-memory database, use a URI such as file:/app?vfs=memdb.
 func Open(dsn string, opts ...Option) (*entsql.Driver, error) {
+	if isS3DSN(dsn) {
+		return nil, errors.New("enlite: use OpenWithBackup for an S3 DSN")
+	}
+	cfg, err := parseConfig(dsn, opts)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.backup != nil || cfg.restoreOnMissing {
+		return nil, errors.New("enlite: use OpenWithBackup with backup options")
+	}
+	connector, err := cfg.connector()
+	if err != nil {
+		return nil, err
+	}
+	return cfg.driver(connector), nil
+}
+
+func parseConfig(dsn string, opts []Option) (config, error) {
 	if strings.HasPrefix(dsn, "file:") {
 		dsn, _, _ = strings.Cut(dsn, "#")
 	}
 	name, query, _ := strings.Cut(dsn, "?")
 	params, err := url.ParseQuery(query)
 	if err != nil {
-		return nil, fmt.Errorf("enlite: parse DSN parameters: %w", err)
+		return config{}, fmt.Errorf("enlite: parse DSN parameters: %w", err)
 	}
 	path, err := databasePath(name)
 	if err != nil {
-		return nil, err
+		return config{}, err
 	}
 	// SQLite truncates URI fields at %00. Reject it so the pool policy and
 	// the engine operate on the same path and parameters.
 	if strings.ContainsRune(dsn, 0) || strings.ContainsRune(path, 0) || strings.Contains(query, "%00") {
-		return nil, errors.New("enlite: DSN cannot contain NUL")
+		return config{}, errors.New("enlite: DSN cannot contain NUL")
 	}
 	params["_pragma"] = append([]string{"foreign_keys(1)"}, params["_pragma"]...)
-	cfg := config{params: params}
+	cfg := config{name: name, path: path, params: params}
 	for _, opt := range opts {
 		if opt == nil {
-			return nil, errors.New("enlite: nil option")
+			return config{}, errors.New("enlite: nil option")
 		}
 		if err := opt(&cfg); err != nil {
-			return nil, err
+			return config{}, err
 		}
 	}
 	if privateDatabase(path, params) {
 		if cfg.poolSize > 1 {
-			return nil, errors.New("enlite: private in-memory or temporary database requires a pool size of one; use a file:/name?vfs=memdb URI to share an in-memory database")
+			return config{}, errors.New("enlite: private in-memory or temporary database requires a pool size of one; use a file:/name?vfs=memdb URI to share an in-memory database")
 		}
 		cfg.poolSize = 1
 	}
-	connector, err := sqlite.NewConnector(name+"?"+params.Encode(), cfg.sqliteOptions...)
+	return cfg, nil
+}
+
+func (cfg config) connector() (*sqlite.Connector, error) {
+	connector, err := sqlite.NewConnector(cfg.name+"?"+cfg.params.Encode(), cfg.sqliteOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("enlite: create SQLite connector: %w", err)
 	}
+	return connector, nil
+}
+
+func (cfg config) driver(connector *sqlite.Connector) *entsql.Driver {
 	db := sql.OpenDB(connector)
 	if cfg.poolSize > 0 {
 		db.SetMaxOpenConns(cfg.poolSize)
 		db.SetMaxIdleConns(cfg.poolSize)
 	}
-	return entsql.OpenDB(dialect.SQLite, db), nil
+	return entsql.OpenDB(dialect.SQLite, db)
 }
 
 func databasePath(name string) (string, error) {
